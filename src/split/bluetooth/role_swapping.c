@@ -22,7 +22,6 @@ extern int zmk_split_bt_central_init(void);
 extern int zmk_peripheral_ble_init(void);
 
 #define ROLE_SWAP_MAGIC 0xAB
-#define PERIPHERAL_RESET_DELAY_MS 100
 #define SETTINGS_KEY_IS_CENTRAL "ble_role_swap/is_central"
 #define SETTINGS_KEY_CENTRAL_PROFILE "ble_role_swap/central_profile"
 #define SETTINGS_KEY_PERIPHERAL_PROFILE "ble_role_swap/peripheral_profile"
@@ -257,9 +256,6 @@ int zmk_role_swapping_handle_rst_command(const struct zmk_split_transport_centra
         LOG_ERR("Failed to save settings for role switch: %d", ret);
         // Continue anyway - central will reset and we should follow
     }
-
-    // Brief delay to coordinate with central, then reset
-    k_sleep(K_MSEC(PERIPHERAL_RESET_DELAY_MS));
     
     LOG_INF("Resetting to complete role switch");
     sys_reboot(SYS_REBOOT_WARM);
@@ -288,10 +284,6 @@ int zmk_role_swapping_handle_ack_event(uint8_t source, const struct zmk_split_tr
 
     LOG_INF("Valid ACK received - proceeding with role switch reset");
 
-    // Brief delay to ensure peripheral has time to reset first
-    k_sleep(K_MSEC(PERIPHERAL_RESET_DELAY_MS));
-    
-    LOG_INF("Resetting to complete role switch");
     sys_reboot(SYS_REBOOT_WARM);
 
     return 0; // Never reached
