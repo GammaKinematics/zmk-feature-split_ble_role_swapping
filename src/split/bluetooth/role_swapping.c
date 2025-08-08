@@ -11,6 +11,7 @@
 #include <zmk/events/activity_state_changed.h>
 #include <zmk/split/central.h>
 #include <zmk/split/transport/central.h>
+#include <zmk/split/transport/peripheral.h>
 
 #include <zmk_feature_split_ble_role_swapping/split/bluetooth/role_swapping.h>
 
@@ -21,7 +22,6 @@ extern int zmk_split_bt_central_init(void);
 extern int zmk_peripheral_ble_init(void);
 
 #define ROLE_SWAP_MAGIC 0xAB
-#define RST_TIMEOUT_MS 2000
 #define PERIPHERAL_RESET_DELAY_MS 100
 #define SETTINGS_KEY_IS_CENTRAL "ble_role_swap/is_central"
 #define SETTINGS_KEY_CENTRAL_PROFILE "ble_role_swap/central_profile"
@@ -35,17 +35,10 @@ static bool is_central = false;
 static uint8_t central_profile_index = 0;
 static uint8_t peripheral_profile_index = 0;
 
-// Role switch coordination state (central only)
-static bool waiting_for_ack = false;
-static struct k_work_delayable rst_timeout_work;
-
 // Forward declarations
 static int load_settings(void);
 static int save_current_role_settings(bool new_is_central);
 static int initiate_role_switch(void);
-static void rst_timeout_handler(struct k_work *work);
-static int handle_role_switch_ack(uint8_t magic);
-static int handle_role_switch_rst(uint8_t magic);
 
 /**
  * Determine role for first boot when no settings exist
@@ -64,59 +57,67 @@ static int load_settings(void) {
     // Load is_central setting
     len = sizeof(is_central);
     ret = settings_load_binary(SETTINGS_KEY_IS_CENTRAL, &is_central, &len);
-    if (ret != 0 || len != sizeof(is_central)) {
-        LOG_INF("No role settings found, using default");
+    if (ret || len != sizeof(is_central)) {
+        LOG_INF("No role setting found, using default: %s", 
+                get_default_role() ? "central" : "peripheral");
         is_central = get_default_role();
+    } else {
+        LOG_INF("Loaded role setting: %s", is_central ? "central" : "peripheral");
     }
 
-    // Load central profile index
+    // Load central profile setting
     len = sizeof(central_profile_index);
     ret = settings_load_binary(SETTINGS_KEY_CENTRAL_PROFILE, &central_profile_index, &len);
-    if (ret != 0 || len != sizeof(central_profile_index)) {
-        central_profile_index = 0; // Default to profile 0
+    if (ret || len != sizeof(central_profile_index)) {
+        LOG_INF("No central profile setting found, using default: 0");
+        central_profile_index = 0;
+    } else {
+        LOG_INF("Loaded central profile: %d", central_profile_index);
     }
 
-    // Load peripheral profile index
+    // Load peripheral profile setting
     len = sizeof(peripheral_profile_index);
     ret = settings_load_binary(SETTINGS_KEY_PERIPHERAL_PROFILE, &peripheral_profile_index, &len);
-    if (ret != 0 || len != sizeof(peripheral_profile_index)) {
-        peripheral_profile_index = 0; // Default to profile 0
+    if (ret || len != sizeof(peripheral_profile_index)) {
+        LOG_INF("No peripheral profile setting found, using default: 1");
+        peripheral_profile_index = 1;
+    } else {
+        LOG_INF("Loaded peripheral profile: %d", peripheral_profile_index);
     }
-
-    LOG_INF("Loaded settings: is_central=%d, central_profile=%d, peripheral_profile=%d",
-            is_central, central_profile_index, peripheral_profile_index);
 
     return 0;
 }
 
 /**
- * Save current settings to flash storage
+ * Save current role and profile information to settings
  */
 static int save_current_role_settings(bool new_is_central) {
     int ret;
-    
-    // Save current active profile to appropriate role setting
-    uint8_t active_profile = zmk_ble_active_profile_index();
+
+    // Save current profile to appropriate role setting
+    uint8_t current_profile = zmk_ble_active_profile_index();
     
     if (current_role_is_central) {
         // Currently central, save current profile as central profile
-        ret = settings_save_one(SETTINGS_KEY_CENTRAL_PROFILE, &active_profile, sizeof(active_profile));
+        ret = settings_save_one(SETTINGS_KEY_CENTRAL_PROFILE, &current_profile, sizeof(current_profile));
         if (ret) {
             LOG_ERR("Failed to save central profile: %d", ret);
             return ret;
         }
-        central_profile_index = active_profile;
+        central_profile_index = current_profile;
+        LOG_INF("Saved central profile: %d", current_profile);
     } else {
         // Currently peripheral, save current profile as peripheral profile
-        ret = settings_save_one(SETTINGS_KEY_PERIPHERAL_PROFILE, &active_profile, sizeof(active_profile));
+        ret = settings_save_one(SETTINGS_KEY_PERIPHERAL_PROFILE, &current_profile, sizeof(current_profile));
         if (ret) {
             LOG_ERR("Failed to save peripheral profile: %d", ret);
             return ret;
         }
-        peripheral_profile_index = active_profile;
+        peripheral_profile_index = current_profile;
+        LOG_INF("Saved peripheral profile: %d", current_profile);
     }
 
-    // Save new role
+    // Save new role setting
     ret = settings_save_one(SETTINGS_KEY_IS_CENTRAL, &new_is_central, sizeof(new_is_central));
     if (ret) {
         LOG_ERR("Failed to save is_central: %d", ret);
@@ -141,12 +142,6 @@ static int activity_state_listener(const zmk_event_t *eh) {
 
     // Only central evaluates role switches
     if (!current_role_is_central) {
-        return ZMK_EV_EVENT_BUBBLE;
-    }
-
-    // Don't start new role switch if one is in progress
-    if (waiting_for_ack) {
-        LOG_DBG("Role switch in progress - skipping evaluation");
         return ZMK_EV_EVENT_BUBBLE;
     }
 
@@ -187,52 +182,23 @@ static int activity_state_listener(const zmk_event_t *eh) {
 }
 
 /**
- * Split transport event listener - handles coordination messages
- */
-static int split_transport_listener(const zmk_event_t *eh) {
-    // Handle peripheral battery state changed events for ACK messages on central
-    if (current_role_is_central) {
-        const struct zmk_peripheral_battery_state_changed *battery_ev;
-        if ((battery_ev = as_zmk_peripheral_battery_state_changed(eh)) != NULL) {
-            // This is the existing battery event - we don't interfere with it
-            return ZMK_EV_EVENT_BUBBLE;
-        }
-        
-        // TODO: Add handler for role switch ACK events when transport extension is implemented
-        // For now, we'd need to add this once we extend the transport system
-    }
-
-    return ZMK_EV_EVENT_BUBBLE;
-}
-
-/**
- * Split command handler (peripheral side) - handles RST commands
- * NOTE: This would be called by the split transport when our command type is received
- */
-static int split_command_handler(uint8_t source, struct zmk_split_transport_central_command *cmd) {
-    if (cmd->type != ZMK_SPLIT_TRANSPORT_CENTRAL_CMD_TYPE_ROLE_SWAP_RST) {
-        return 0; // Not our command
-    }
-
-    return handle_role_switch_rst(cmd->data.role_switch_rst.magic);
-}
-
-/**
- * Initiate role switch by coordinating with peripheral via RST/ACK handshake
+ * Initiate role switch by sending RST command to peripheral
  */
 static int initiate_role_switch(void) {
     int ret;
 
-    if (waiting_for_ack) {
-        LOG_WRN("Role switch already in progress, ignoring request");
-        return -EBUSY;
-    }
-
     LOG_INF("Initiating role switch - sending RST command to peripheral");
+
+    // Save settings with swapped role before sending command
+    ret = save_current_role_settings(!current_role_is_central);
+    if (ret) {
+        LOG_ERR("Failed to save settings for role switch: %d", ret);
+        return ret;
+    }
 
     // Send RST command to peripheral
     struct zmk_split_transport_central_command command = {
-        .type = ZMK_SPLIT_TRANSPORT_CENTRAL_CMD_TYPE_ROLE_SWITCH_RST,
+        .type = ZMK_SPLIT_TRANSPORT_CENTRAL_CMD_TYPE_ROLE_SWAP_RST,
         .data = {.role_switch_rst = {.magic = ROLE_SWAP_MAGIC}}
     };
 
@@ -242,80 +208,36 @@ static int initiate_role_switch(void) {
         return ret;
     }
 
-    // Set waiting state and start timeout
-    waiting_for_ack = true;
-    k_work_schedule(&rst_timeout_work, K_MSEC(RST_TIMEOUT_MS));
-
-    LOG_DBG("RST command sent, waiting for ACK (timeout: %dms)", RST_TIMEOUT_MS);
+    LOG_INF("RST command sent - peripheral will send ACK if ready");
     return 0;
 }
 
 /**
- * Handle timeout waiting for ACK from peripheral
- */
-static void rst_timeout_handler(struct k_work *work) {
-    if (!waiting_for_ack) {
-        return;
-    }
-
-    LOG_WRN("Timeout waiting for role switch ACK from peripheral - aborting");
-    waiting_for_ack = false;
-}
-
-/**
- * Handle ACK received from peripheral - complete the role switch
- */
-static int handle_role_switch_ack(uint8_t magic) {
-    if (!waiting_for_ack) {
-        LOG_WRN("Received unexpected role switch ACK");
-        return 0;
-    }
-
-    if (magic != ROLE_SWAP_MAGIC) {
-        LOG_WRN("Received role switch ACK with invalid magic: 0x%02X", magic);
-        return -EINVAL;
-    }
-
-    LOG_INF("Received role switch ACK - completing role switch");
-
-    // Cancel timeout and clear waiting state
-    k_work_cancel_delayable(&rst_timeout_work);
-    waiting_for_ack = false;
-
-    // Save settings with swapped role
-    int ret = save_current_role_settings(!current_role_is_central);
-    if (ret) {
-        LOG_ERR("Failed to save settings for role switch: %d", ret);
-        return ret;
-    }
-
-    // Brief delay then reset
-    k_sleep(K_MSEC(100));
-    
-    LOG_INF("Resetting to complete role switch");
-    sys_reboot(SYS_REBOOT_WARM);
-
-    return 0; // Never reached
-}
-
-/**
  * Handle RST command received from central (peripheral side)
+ * Called by core ZMK transport system
  */
-static int handle_role_switch_rst(uint8_t magic) {
-    if (magic != ROLE_SWAP_MAGIC) {
-        LOG_WRN("Received role switch RST with invalid magic: 0x%02X", magic);
+int zmk_role_swapping_handle_rst_command(const struct zmk_split_transport_central_role_switch_rst_data *data) {
+    LOG_INF("Received role switch RST command");
+
+    // Validate magic number
+    if (data->magic != ROLE_SWAP_MAGIC) {
+        LOG_WRN("Invalid magic in RST command: 0x%02X", data->magic);
         return -EINVAL;
     }
 
-    LOG_INF("Received role switch RST command from central");
-
-    // Check if we're currently active
-    if (zmk_activity_get_state() == ZMK_ACTIVITY_ACTIVE) {
-        LOG_INF("Currently active - ignoring role switch request");
+    // Safety checks - peripheral can decline role switch
+    uint8_t battery_level = zmk_battery_state_of_charge();
+    if (battery_level < 10) {  // Don't switch if battery critically low
+        LOG_WRN("Battery too low for role switch (%d%%) - declining", battery_level);
         return 0; // Don't send ACK
     }
 
-    LOG_INF("Ready for role switch - sending ACK and preparing to reset");
+    // Add other safety checks here as needed:
+    // - Check for active key presses
+    // - Check for ongoing operations
+    // - Validate system state
+
+    LOG_INF("Safety checks passed - sending ACK and preparing to reset");
 
     // Send ACK back to central
     struct zmk_split_transport_peripheral_event ev = {
@@ -336,7 +258,37 @@ static int handle_role_switch_rst(uint8_t magic) {
         // Continue anyway - central will reset and we should follow
     }
 
-    // Delay briefly to coordinate with central, then reset
+    // Brief delay to coordinate with central, then reset
+    k_sleep(K_MSEC(PERIPHERAL_RESET_DELAY_MS));
+    
+    LOG_INF("Resetting to complete role switch");
+    sys_reboot(SYS_REBOOT_WARM);
+
+    return 0; // Never reached
+}
+
+/**
+ * Handle ACK event received from peripheral (central side)
+ * Called by core ZMK transport system
+ */
+int zmk_role_swapping_handle_ack_event(uint8_t source, const struct zmk_split_transport_peripheral_role_switch_ack_data *data) {
+    LOG_INF("Received role switch ACK from peripheral %d", source);
+
+    // Validate magic number
+    if (data->magic != ROLE_SWAP_MAGIC) {
+        LOG_WRN("Invalid magic in ACK event: 0x%02X", data->magic);
+        return -EINVAL;
+    }
+
+    // Validate source
+    if (source != 0) {
+        LOG_WRN("Unexpected ACK source: %d", source);
+        return -EINVAL;
+    }
+
+    LOG_INF("Valid ACK received - proceeding with role switch reset");
+
+    // Brief delay to ensure peripheral has time to reset first
     k_sleep(K_MSEC(PERIPHERAL_RESET_DELAY_MS));
     
     LOG_INF("Resetting to complete role switch");
@@ -430,23 +382,20 @@ ZMK_SUBSCRIPTION(role_swapping, zmk_activity_state_changed);
 /**
  * Public API functions
  */
-bool zmk_role_swapping_is_central(void) {
-    return current_role_is_central;
-}
 
 int zmk_role_swapping_manual_switch(void) {
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_ROLE_SWAPPING_MANUAL_SWITCH_BEHAVIOR)
+    if (!current_role_is_central) {
+        LOG_WRN("Manual role switch can only be initiated from central");
+        return -ENOTSUP;
+    }
+    
     LOG_INF("Manual role switch triggered");
     return initiate_role_switch();
 #else
     LOG_WRN("Manual role switching not enabled in configuration");
     return -ENOTSUP;
 #endif
-}
-
-bool zmk_role_swapping_is_active(void) {
-    // Role switching is active if we're central (only central monitors battery)
-    return current_role_is_central;
 }
 
 // Initialize at the same priority as the original split init functions
