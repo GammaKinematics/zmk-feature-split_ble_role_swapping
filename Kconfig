@@ -1,0 +1,38 @@
+if ZMK_SPLIT_BLE_ROLE_SWAPPING
+
+config ZMK_SPLIT_BLE_ROLE_SWAPPING_BATTERY_THRESHOLD
+    int "Battery difference threshold for role switch (%)"
+    range 5 50
+    default 10
+    help
+      Minimum battery level difference required to trigger a role switch.
+      Higher values reduce frequency of role switches but may result in
+      less optimal power distribution. Lower values provide more aggressive
+      optimization but may cause frequent switching.
+
+config ZMK_SPLIT_BLE_ROLE_SWAPPING_CENTRAL_DEFAULT
+    bool "Default to central role on first boot"
+    default y
+    help
+      If enabled, device defaults to central role when no role settings
+      exist in flash storage (i.e., on very first boot). Otherwise defaults
+      to peripheral role. This setting only affects the initial role
+      assignment - subsequent boots will use the saved role preference.
+
+config ZMK_SPLIT_BLE_ROLE_SWAPPING_MANUAL_SWITCH_BEHAVIOR
+    bool "Enable manual role switch behavior"
+    default n
+    help
+      Enable a behavior that allows manual triggering of role switches
+      for testing and debugging purposes. This adds a small amount of
+      code but can be useful during development.
+
+config ZMK_SPLIT_BLE_ROLE_SWAPPING_LOG_LEVEL
+    int "Role swapping module log level"
+    range 0 4
+    default 3
+    help
+      Set the log level for role swapping debug messages.
+      0=OFF, 1=ERR, 2=WRN, 3=INF, 4=DBG
+
+endif # ZMK_SPLIT_BLE_ROLE_SWAPPING
